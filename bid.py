@@ -5,6 +5,7 @@ import json
 from datetime import datetime
 from fpdf import FPDF
 import base64
+from mindee import Client, product
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="Handyman Bid Pro", layout="wide", page_icon="🛠️")
@@ -13,10 +14,8 @@ st.set_page_config(page_title="Handyman Bid Pro", layout="wide", page_icon="🛠
 def init_db():
     conn = sqlite3.connect('handyman_jobs.db')
     c = conn.cursor()
-    # Create Customers Table
     c.execute('''CREATE TABLE IF NOT EXISTS customers
                  (id INTEGER PRIMARY KEY, name TEXT, email TEXT, phone TEXT, address TEXT)''')
-    # Create Bids Table
     c.execute('''CREATE TABLE IF NOT EXISTS bids
                  (id INTEGER PRIMARY KEY, customer_id INTEGER, project_name TEXT, 
                   date_created TEXT, items_json TEXT, subtotal REAL, 
@@ -76,6 +75,56 @@ def update_bid_status(bid_id, new_status):
     conn.commit()
     conn.close()
 
+# --- RECEIPT PARSING FUNCTION ---
+def parse_receipt(api_key, uploaded_file):
+    try:
+        # Initialize Mindee Client
+        mindee_client = Client(api_key=api_key)
+        
+        # Load the file from bytes
+        input_doc = mindee_client.source_from_bytes(
+            uploaded_file.getvalue(), 
+            uploaded_file.name
+        )
+        
+        # Parse using the specialized Receipt model
+        result = mindee_client.parse(product.ReceiptV5, input_doc)
+        
+        # Extract line items if available, otherwise just get total
+        items_found = []
+        
+        # Try to get specific line items from the receipt
+        # Note: ReceiptV5 is very good at getting the Total, but line items can vary by store.
+        # If it finds distinct items, we add them. If not, we add one "Receipt Import" item.
+        
+        if result.document.inference.prediction.line_items:
+            for item in result.document.inference.prediction.line_items:
+                desc = item.description if item.description else "Scanned Item"
+                cost = item.total_amount if item.total_amount else 0.0
+                items_found.append({
+                    "Description": desc, 
+                    "Material Cost": float(cost), 
+                    "Labor Hours": 0.0, 
+                    "Hourly Rate": 50.00
+                })
+        else:
+            # Fallback: Just grab the total if individual lines aren't clear
+            total = result.document.inference.prediction.total_amount.value
+            supplier = result.document.inference.prediction.supplier_name.value
+            date = result.document.inference.prediction.date.value
+            desc = f"Receipt from {supplier} ({date})"
+            items_found.append({
+                "Description": desc, 
+                "Material Cost": float(total) if total else 0.0, 
+                "Labor Hours": 0.0, 
+                "Hourly Rate": 50.00
+            })
+            
+        return items_found
+    except Exception as e:
+        st.error(f"Error parsing receipt: {e}")
+        return []
+
 # --- PDF GENERATOR ---
 class PDF(FPDF):
     def header(self):
@@ -88,30 +137,26 @@ def create_pdf(customer_name, project_name, items_df, totals):
     pdf.add_page()
     pdf.set_font("Arial", size=12)
     
-    # Info
     pdf.cell(200, 10, txt=f"Customer: {customer_name}", ln=1)
     pdf.cell(200, 10, txt=f"Project: {project_name}", ln=1)
     pdf.cell(200, 10, txt=f"Date: {datetime.now().strftime('%Y-%m-%d')}", ln=1)
     pdf.ln(10)
     
-    # Table Header
     pdf.set_fill_color(200, 220, 255)
     pdf.cell(80, 10, "Description", 1, 0, 'L', 1)
     pdf.cell(30, 10, "Mat. Cost", 1, 0, 'R', 1)
     pdf.cell(30, 10, "Labor Hrs", 1, 0, 'R', 1)
     pdf.cell(40, 10, "Total", 1, 1, 'R', 1)
     
-    # Table Body
     for index, row in items_df.iterrows():
         line_total = row['Material Cost'] + (row['Labor Hours'] * row['Hourly Rate'])
-        pdf.cell(80, 10, str(row['Description']), 1)
+        pdf.cell(80, 10, str(row['Description'])[:30], 1) # Truncate long desc
         pdf.cell(30, 10, f"${row['Material Cost']:.2f}", 1, 0, 'R')
         pdf.cell(30, 10, str(row['Labor Hours']), 1, 0, 'R')
         pdf.cell(40, 10, f"${line_total:.2f}", 1, 1, 'R')
         
     pdf.ln(10)
     
-    # Totals
     pdf.cell(140, 10, "Subtotal:", 0, 0, 'R')
     pdf.cell(40, 10, f"${totals['subtotal']:.2f}", 0, 1, 'R')
     
@@ -131,8 +176,12 @@ def create_pdf(customer_name, project_name, items_df, totals):
 
 st.title("🛠️ Handyman Bid Calculator & Manager")
 
-# Sidebar Navigation
-menu = st.sidebar.radio("Menu", ["New Estimate", "Client Database", "Bid History"])
+# Sidebar
+with st.sidebar:
+    menu = st.radio("Menu", ["New Estimate", "Client Database", "Bid History"])
+    st.divider()
+    st.caption("Receipt Scanner Settings")
+    mindee_api_key = st.text_input("Mindee API Key", type="password", help="Get a free key at platform.mindee.com")
 
 # --- TAB: CLIENT DATABASE ---
 if menu == "Client Database":
@@ -155,7 +204,6 @@ if menu == "Client Database":
 
     st.subheader("Existing Clients")
     clients = get_customers()
-    # UPDATED: Replaced use_container_width=True with width="stretch"
     st.dataframe(clients, width="stretch")
 
 # --- TAB: NEW ESTIMATE ---
@@ -163,6 +211,12 @@ elif menu == "New Estimate":
     st.header("Create New Job Bid")
     
     clients = get_customers()
+    
+    # Initialize session state for line items if not exists
+    if 'bid_items' not in st.session_state:
+        st.session_state.bid_items = [
+            {"Description": "Labor - Prep Work", "Material Cost": 0.00, "Labor Hours": 2.0, "Hourly Rate": 50.00},
+        ]
     
     if clients.empty:
         st.warning("Please add a client in the 'Client Database' tab first.")
@@ -174,17 +228,40 @@ elif menu == "New Estimate":
         with col2:
             project_name = st.text_input("Project Name (e.g., Kitchen Painting)")
 
-        st.subheader("Job Details (Line Items)")
-        st.info("💡 Tip: Enter materials and labor for each task. Leave Hourly Rate as 0 for material-only items.")
+        # --- RECEIPT SCANNER SECTION ---
+        with st.expander("📸 Scan Receipt for Materials", expanded=False):
+            st.write("Upload an image of a receipt to automatically add items.")
+            uploaded_receipt = st.file_uploader("Upload Receipt", type=['jpg', 'png', 'jpeg', 'pdf'])
+            
+            if uploaded_receipt and st.button("Process Receipt"):
+                if not mindee_api_key:
+                    st.error("Please enter your Mindee API Key in the sidebar to use this feature.")
+                else:
+                    with st.spinner("Analyzing receipt..."):
+                        new_items = parse_receipt(mindee_api_key, uploaded_receipt)
+                        if new_items:
+                            st.session_state.bid_items.extend(new_items)
+                            st.success(f"Added {len(new_items)} items from receipt!")
+                            st.rerun()
+                        else:
+                            st.warning("Could not extract items. Try a clearer image.")
 
-        # Data Editor for Line Items
-        default_data = pd.DataFrame([
-            {"Description": "Materials (Paint, Tile, Wood)", "Material Cost": 0.00, "Labor Hours": 0.0, "Hourly Rate": 50.00},
-            {"Description": "Labor - Prep Work", "Material Cost": 0.00, "Labor Hours": 0.0, "Hourly Rate": 50.00},
-        ])
+        # --- LINE ITEMS EDITOR ---
+        st.subheader("Job Details")
         
-        # UPDATED: Replaced use_container_width=True with width="stretch"
-        edited_df = st.data_editor(default_data, num_rows="dynamic", width="stretch")
+        # Convert session state list to DF for editing
+        df_input = pd.DataFrame(st.session_state.bid_items)
+        
+        edited_df = st.data_editor(
+            df_input, 
+            num_rows="dynamic", 
+            width="stretch",
+            key="data_editor_key" 
+        )
+
+        # Update session state with edits (so they persist if we scan another receipt)
+        # We don't auto-update session state here because data_editor handles it, 
+        # but we need to ensure calculations use the latest 'edited_df'
 
         # Calculations
         edited_df['Line Total'] = edited_df['Material Cost'] + (edited_df['Labor Hours'] * edited_df['Hourly Rate'])
@@ -208,24 +285,18 @@ elif menu == "New Estimate":
             st.caption(f"Subtotal: ${raw_subtotal:,.2f} | Markup: ${markup_amt:,.2f} | Tax: ${tax_amt:,.2f}")
 
         # Actions
-        st.write("### Actions")
-        
         col_btn1, col_btn2 = st.columns([1, 2])
         
-        save_clicked = col_btn1.button("💾 Save Bid to History", type="primary")
-        
-        if save_clicked:
+        if col_btn1.button("💾 Save Bid to History", type="primary"):
             if project_name:
                 bid_id = save_bid(selected_client_id, project_name, edited_df, raw_subtotal, markup_pct, tax_pct, final_total)
                 st.success(f"Bid saved! ID: {bid_id}")
             else:
                 st.error("Please enter a Project Name.")
 
-        # Email / PDF Logic
         if project_name and not edited_df.empty:
             client_data = clients[clients['id'] == selected_client_id].iloc[0]
             
-            # Generate PDF
             totals = {
                 'subtotal': raw_subtotal, 'markup': markup_pct, 'markup_amt': markup_amt,
                 'tax': tax_pct, 'tax_amt': tax_amt, 'total': final_total
@@ -239,17 +310,13 @@ elif menu == "New Estimate":
                 mime="application/pdf"
             )
 
-            # Generate Email Link
             email_subject = f"Estimate for {project_name}"
-            email_body = f"""Hi {client_data['name']},%0D%0A%0D%0AHere is the estimate for the {project_name}.%0D%0A%0D%0A
-            Total Estimate: ${final_total:,.2f}%0D%0A%0D%0A
-            Includes materials, labor, and necessary prep work.%0D%0A%0D%0A
-            Please let me know if you would like to proceed!"""
+            email_body = f"Hi {client_data['name']},%0D%0A%0D%0AHere is the estimate for {project_name}.%0D%0A%0D%0ATotal: ${final_total:,.2f}"
             
             st.markdown(f"""
             <a href="mailto:{client_data['email']}?subject={email_subject}&body={email_body}" target="_blank" 
             style="display: inline-block; padding: 0.5em 1em; color: white; background-color: #FF4B4B; border-radius: 5px; text-decoration: none;">
-            📧 Click to Email Client
+            📧 Email Client
             </a>
             """, unsafe_allow_html=True)
 
@@ -261,27 +328,19 @@ elif menu == "Bid History":
     if bids.empty:
         st.info("No bids created yet.")
     else:
-        # Filters
         status_filter = st.multiselect("Filter by Status", options=bids['status'].unique(), default=bids['status'].unique())
         filtered_bids = bids[bids['status'].isin(status_filter)]
         
-        # UPDATED: Replaced use_container_width=True with width="stretch"
-        st.dataframe(
-            filtered_bids[['id', 'date_created', 'customer', 'project_name', 'total', 'status']],
-            width="stretch"
-        )
+        st.dataframe(filtered_bids[['id', 'date_created', 'customer', 'project_name', 'total', 'status']], width="stretch")
 
         st.divider()
         st.subheader("Update Status")
-        c1, c2, c3 = st.columns(3)
+        c1, c2 = st.columns(2)
         with c1:
-            bid_to_edit = st.selectbox("Select Bid ID to Update", options=bids['id'])
+            bid_to_edit = st.selectbox("Select Bid ID", options=bids['id'])
         with c2:
             new_status = st.selectbox("New Status", ["Draft", "Sent", "Approved", "Declined", "Completed", "Paid"])
-        with c3:
-            st.write("") # Spacing
-            st.write("") 
             if st.button("Update Status"):
                 update_bid_status(bid_to_edit, new_status)
-                st.success(f"Bid {bid_to_edit} updated to {new_status}")
-                st.rerun()
+                st.success("Status updated!")
+                st.rerun()tre
